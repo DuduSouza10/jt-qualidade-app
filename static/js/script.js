@@ -1,11 +1,24 @@
 const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
 const els = {
+  sidebarLinks: $$(".sidebar-link"),
+  panelWaybill: $("#panelWaybill"),
+  panelPod: $("#panelPod"),
+  heroTitle: $("#heroTitle"),
+  heroDescription: $("#heroDescription"),
+
   username: $("#username"),
   password: $("#password"),
   savePassword: $("#savePassword"),
   recreateProfile: $("#recreateProfile"),
   waybills: $("#waybills"),
+
+  podUsername: $("#podUsername"),
+  podPassword: $("#podPassword"),
+  podSavePassword: $("#podSavePassword"),
+  podRecreateProfile: $("#podRecreateProfile"),
+  podIds: $("#podIds"),
 
   startBtn: $("#startBtn"),
   stopBtn: $("#stopBtn"),
@@ -16,6 +29,12 @@ const els = {
   togglePassword: $("#togglePassword"),
   clearLogsBtn: $("#clearLogsBtn"),
 
+  podStartBtn: $("#podStartBtn"),
+  podStopBtn: $("#podStopBtn"),
+  podExportBtn: $("#podExportBtn"),
+  togglePodPassword: $("#togglePodPassword"),
+  podClearLogsBtn: $("#podClearLogsBtn"),
+
   statusText: $("#statusText"),
   statusSubText: $("#statusSubText"),
 
@@ -23,11 +42,20 @@ const els = {
   progressPercent: $("#progressPercent"),
   progressFill: $("#progressFill"),
 
+  podProgressLabel: $("#podProgressLabel"),
+  podProgressPercent: $("#podProgressPercent"),
+  podProgressFill: $("#podProgressFill"),
+
   logsBox: $("#logsBox"),
+  podLogsBox: $("#podLogsBox"),
   resultsBody: $("#resultsBody"),
   resultsCount: $("#resultsCount"),
+  podResultsBody: $("#podResultsBody"),
+  podResultsCount: $("#podResultsCount"),
 
   exportModal: $("#exportModal"),
+  exportModalTitle: $("#exportModalTitle"),
+  exportPreviewHead: $("#exportPreviewHead"),
   closeExportModal: $("#closeExportModal"),
   cancelExportBtn: $("#cancelExportBtn"),
   confirmExportBtn: $("#confirmExportBtn"),
@@ -37,17 +65,91 @@ const els = {
   exportPreviewBody: $("#exportPreviewBody"),
 };
 
+const panelCopy = {
+  waybill: {
+    title: "Verificação de ID's",
+    description:
+      "O Chrome será aberto apenas para login e captcha. Após detectar o token, o navegador será fechado e as verificações seguirão em segundo plano.",
+    emptyLog: "Os logs vão aparecer aqui quando iniciar.",
+  },
+  pod: {
+    title: "POD Tracking",
+    description:
+      "Consulta a rota de POD Tracking por ID, lê o primeiro item de data[0].details[0] e monta o preview com Tempo de Digitalização, Tipo de Bipagem, Motivo da Bipagem, Base Responsável e Descrição da Etapa de Bipagem.",
+    emptyLog: "Os logs do POD vão aparecer aqui quando iniciar.",
+  },
+};
+
 let pollTimer = null;
 let saveTimer = null;
 let lastLogLength = 0;
+let lastPodLogLength = 0;
+let activePanel = "waybill";
+let exportContext = "waybill";
+let lastWaybillStatus = null;
+let lastPodStatus = null;
+let lastResultsSignature = "";
+let lastPodResultsSignature = "";
+let lastLogsSignature = "";
+let lastPodLogsSignature = "";
+
+function restartAnimation(element, className = "animating") {
+  if (!element) return;
+
+  element.classList.remove(className);
+
+  // Força reflow para a animação reiniciar quando trocar de painel.
+  void element.offsetWidth;
+
+  element.classList.add(className);
+}
+
+function sharedUsername() {
+  return (activePanel === "pod" ? els.podUsername.value : els.username.value).trim();
+}
+
+function sharedPassword() {
+  return activePanel === "pod" ? els.podPassword.value : els.password.value;
+}
+
+function sharedSavePassword() {
+  return activePanel === "pod" ? els.podSavePassword.checked : els.savePassword.checked;
+}
+
+function sharedRecreateProfile() {
+  return activePanel === "pod" ? els.podRecreateProfile.checked : els.recreateProfile.checked;
+}
 
 function collectPayload() {
   return {
+    username: sharedUsername(),
+    password: sharedPassword(),
+    save_password: sharedSavePassword(),
+    recreate_profile: sharedRecreateProfile(),
+    waybills: els.waybills.value,
+    pod_ids: els.podIds.value,
+  };
+}
+
+function collectWaybillPayload() {
+  return {
+    ...collectPayload(),
     username: els.username.value.trim(),
     password: els.password.value,
     save_password: els.savePassword.checked,
     recreate_profile: els.recreateProfile.checked,
     waybills: els.waybills.value,
+  };
+}
+
+function collectPodPayload() {
+  return {
+    ...collectPayload(),
+    username: els.podUsername.value.trim(),
+    password: els.podPassword.value,
+    save_password: els.podSavePassword.checked,
+    recreate_profile: els.podRecreateProfile.checked,
+    pod_ids: els.podIds.value,
   };
 }
 
@@ -107,6 +209,12 @@ async function loadConfig() {
     els.savePassword.checked = Boolean(config.save_password);
     els.recreateProfile.checked = Boolean(config.recreate_profile);
     els.waybills.value = config.waybills || "";
+
+    els.podUsername.value = config.username || "";
+    els.podPassword.value = config.password || "";
+    els.podSavePassword.checked = Boolean(config.save_password);
+    els.podRecreateProfile.checked = Boolean(config.recreate_profile);
+    els.podIds.value = config.pod_ids || "";
   } catch (error) {
     console.error(error);
   }
@@ -116,7 +224,7 @@ function setSubStatus(text) {
   els.statusSubText.textContent = text;
 }
 
-function setStatus(status, running) {
+function setStatus(status, running, context = activePanel) {
   const labels = {
     idle: "Aguardando",
     running: "Executando",
@@ -125,25 +233,31 @@ function setStatus(status, running) {
     error: "Erro",
   };
 
-  els.statusText.textContent = labels[status] || "Aguardando";
+  if (context === activePanel) {
+    els.statusText.textContent = labels[status] || "Aguardando";
+  }
 
-  if (running) {
-    els.startBtn.disabled = true;
-    els.stopBtn.disabled = false;
+  if (context === "pod") {
+    els.podStartBtn.disabled = Boolean(running);
+    els.podStopBtn.disabled = !running;
   } else {
-    els.startBtn.disabled = false;
-    els.stopBtn.disabled = true;
+    els.startBtn.disabled = Boolean(running);
+    els.stopBtn.disabled = !running;
   }
 }
 
-function updateProgress(current, total) {
+function updateProgress(current, total, context = "waybill") {
   const safeTotal = Number(total || 0);
   const safeCurrent = Number(current || 0);
   const percent = safeTotal > 0 ? Math.round((safeCurrent / safeTotal) * 100) : 0;
 
-  els.progressLabel.textContent = `${safeCurrent} de ${safeTotal}`;
-  els.progressPercent.textContent = `${percent}%`;
-  els.progressFill.style.width = `${Math.min(percent, 100)}%`;
+  const label = context === "pod" ? els.podProgressLabel : els.progressLabel;
+  const percentEl = context === "pod" ? els.podProgressPercent : els.progressPercent;
+  const fill = context === "pod" ? els.podProgressFill : els.progressFill;
+
+  label.textContent = `${safeCurrent} de ${safeTotal}`;
+  percentEl.textContent = `${percent}%`;
+  fill.style.width = `${Math.min(percent, 100)}%`;
 }
 
 function escapeHtml(value) {
@@ -155,17 +269,41 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function renderLogs(logs) {
+function renderLogs(logs, context = "waybill") {
+  const box = context === "pod" ? els.podLogsBox : els.logsBox;
+  const emptyText = context === "pod" ? panelCopy.pod.emptyLog : panelCopy.waybill.emptyLog;
+  const signature = JSON.stringify(logs || []);
+
+  if (context === "pod") {
+    if (signature === lastPodLogsSignature) return;
+    lastPodLogsSignature = signature;
+  } else {
+    if (signature === lastLogsSignature) return;
+    lastLogsSignature = signature;
+  }
+
   if (!logs || logs.length === 0) {
-    els.logsBox.innerHTML = `<div class="empty-log">Os logs vão aparecer aqui quando iniciar.</div>`;
-    lastLogLength = 0;
+    box.innerHTML = `<div class="empty-log static-empty">${emptyText}</div>`;
+
+    if (context === "pod") {
+      lastPodLogLength = 0;
+    } else {
+      lastLogLength = 0;
+    }
+
     return;
   }
 
-  const shouldScroll = logs.length !== lastLogLength;
-  lastLogLength = logs.length;
+  const oldLength = context === "pod" ? lastPodLogLength : lastLogLength;
+  const shouldScroll = logs.length !== oldLength;
 
-  els.logsBox.innerHTML = logs
+  if (context === "pod") {
+    lastPodLogLength = logs.length;
+  } else {
+    lastLogLength = logs.length;
+  }
+
+  box.innerHTML = logs
     .map((line) => {
       const level = line.level || "info";
       const msg = `[${line.time}] ${line.message}`;
@@ -175,7 +313,7 @@ function renderLogs(logs) {
     .join("");
 
   if (shouldScroll) {
-    els.logsBox.scrollTop = els.logsBox.scrollHeight;
+    box.scrollTop = box.scrollHeight;
   }
 }
 
@@ -199,29 +337,90 @@ function statusPill(status) {
 
 function renderResults(results) {
   const count = results ? results.length : 0;
+  const signature = JSON.stringify(results || []);
 
-  els.resultsCount.textContent = `${count} registro${count === 1 ? "" : "s"}`;
+  const countText = `${count} registro${count === 1 ? "" : "s"}`;
+
+  if (els.resultsCount.textContent !== countText) {
+    els.resultsCount.textContent = countText;
+  }
 
   if (!results || results.length === 0) {
+    els.exportBtn.classList.add("disabled");
+
+    const alreadyEmpty = els.resultsBody.querySelector(".empty-row");
+
+    if (alreadyEmpty) {
+      return;
+    }
+
     els.resultsBody.innerHTML = `
-      <tr class="empty-row">
+      <tr class="empty-row static-empty">
         <td colspan="5">Nenhum dado coletado ainda.</td>
       </tr>
     `;
 
-    els.exportBtn.classList.add("disabled");
+    lastResultsSignature = signature;
     return;
   }
 
+  if (signature === lastResultsSignature) {
+    return;
+  }
+
+  lastResultsSignature = signature;
   els.exportBtn.classList.remove("disabled");
 
   els.resultsBody.innerHTML = results
     .map((row) => {
       return `
-        <tr>
+        <tr class="table-row-enter">
           <td>${escapeHtml(row.waybillNos)}</td>
           <td>${escapeHtml(row.goodsName)}</td>
           <td>${escapeHtml(row.insuredAmount)}</td>
+          <td>${statusPill(row.status)}</td>
+          <td>${escapeHtml(row.message)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+function renderPodResults(results) {
+  const count = results ? results.length : 0;
+  const signature = JSON.stringify(results || []);
+
+  els.podResultsCount.textContent = `${count} registro${count === 1 ? "" : "s"}`;
+
+  if (signature === lastPodResultsSignature) {
+    return;
+  }
+
+  lastPodResultsSignature = signature;
+
+  if (!results || results.length === 0) {
+    els.podResultsBody.innerHTML = `
+      <tr class="empty-row static-empty">
+        <td colspan="8">Nenhum dado POD coletado ainda.</td>
+      </tr>
+    `;
+
+    els.podExportBtn.classList.add("disabled");
+    return;
+  }
+
+  els.podExportBtn.classList.remove("disabled");
+
+  els.podResultsBody.innerHTML = results
+    .map((row) => {
+      return `
+        <tr class="table-row-enter">
+          <td>${escapeHtml(row.waybillNo)}</td>
+          <td>${escapeHtml(row.scanTime)}</td>
+          <td>${escapeHtml(row.scanTypeName)}</td>
+          <td>${escapeHtml(row.remark1)}</td>
+          <td>${escapeHtml(row.scanNetworkName)}</td>
+          <td>${escapeHtml(row.podTemplateContent)}</td>
           <td>${statusPill(row.status)}</td>
           <td>${escapeHtml(row.message)}</td>
         </tr>
@@ -238,14 +437,62 @@ function closeModal() {
   els.exportModal.classList.add("hidden");
 }
 
-function renderExportPreview(rows) {
+function setExportHeaders(context) {
+  if (context === "pod") {
+    els.exportModalTitle.textContent = "Preview do XLSX - POD Tracking";
+    els.exportPreviewHead.innerHTML = `
+      <tr>
+        <th>ID do pacote</th>
+        <th>Tempo de Digitalização</th>
+        <th>Tipo de Bipagem</th>
+        <th>Motivo da Bipagem</th>
+        <th>Base Responsável</th>
+        <th>Descrição da Etapa de Bipagem</th>
+        <th>Status</th>
+        <th>Mensagem</th>
+      </tr>
+    `;
+    return;
+  }
+
+  els.exportModalTitle.textContent = "Preview do XLSX";
+  els.exportPreviewHead.innerHTML = `
+    <tr>
+      <th>ID do pacote</th>
+      <th>Conteúdo do Pacote</th>
+      <th>Valor da NF</th>
+    </tr>
+  `;
+}
+
+function renderExportPreview(rows, context = "waybill") {
+  const colspan = context === "pod" ? 6 : 3;
+
   if (!rows || rows.length === 0) {
     els.exportPreviewBody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="3">Nenhum dado para exportar.</td>
+        <td colspan="${colspan}">Nenhum dado para exportar.</td>
       </tr>
     `;
 
+    return;
+  }
+
+  if (context === "pod") {
+    els.exportPreviewBody.innerHTML = rows
+      .map((row) => {
+        return `
+          <tr>
+            <td>${escapeHtml(row.waybillNo)}</td>
+            <td>${escapeHtml(row.scanTime)}</td>
+            <td>${escapeHtml(row.scanTypeName)}</td>
+            <td>${escapeHtml(row.remark1)}</td>
+            <td>${escapeHtml(row.scanNetworkName)}</td>
+            <td>${escapeHtml(row.podTemplateContent)}</td>
+          </tr>
+        `;
+      })
+      .join("");
     return;
   }
 
@@ -262,13 +509,19 @@ function renderExportPreview(rows) {
     .join("");
 }
 
-async function openExportPreview() {
+async function openExportPreview(context = "waybill") {
   try {
-    if (els.exportBtn.classList.contains("disabled")) {
+    const exportButton = context === "pod" ? els.podExportBtn : els.exportBtn;
+
+    if (exportButton.classList.contains("disabled")) {
       return;
     }
 
-    const data = await requestJson("/api/export/preview");
+    exportContext = context;
+    setExportHeaders(context);
+
+    const url = context === "pod" ? "/api/pod/export/preview" : "/api/export/preview";
+    const data = await requestJson(url);
 
     if (!data.total) {
       alert("Não há resultados para exportar.");
@@ -279,9 +532,8 @@ async function openExportPreview() {
     els.exportFolder.textContent = data.folder || "-";
     els.exportTotal.textContent = `${data.total} registro${data.total === 1 ? "" : "s"}`;
 
-    renderExportPreview(data.rows || []);
+    renderExportPreview(data.rows || [], context);
     openModal();
-
   } catch (error) {
     alert(error.message || "Erro ao carregar preview da exportação.");
   }
@@ -292,7 +544,9 @@ async function confirmExport() {
     els.confirmExportBtn.disabled = true;
     els.confirmExportBtn.textContent = "Exportando...";
 
-    const data = await requestJson("/api/export", {
+    const url = exportContext === "pod" ? "/api/pod/export" : "/api/export";
+
+    const data = await requestJson(url, {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -304,35 +558,69 @@ async function confirmExport() {
     );
 
     await pollStatus();
-
   } catch (error) {
     alert(error.message || "Erro ao exportar XLSX.");
-
   } finally {
     els.confirmExportBtn.disabled = false;
     els.confirmExportBtn.textContent = "Confirmar exportação";
   }
 }
 
+function updateActiveHeader() {
+  const copy = panelCopy[activePanel] || panelCopy.waybill;
+  els.heroTitle.textContent = copy.title;
+  els.heroDescription.textContent = copy.description;
+
+  const state = activePanel === "pod" ? lastPodStatus : lastWaybillStatus;
+
+  if (!state) {
+    els.statusText.textContent = "Aguardando";
+    els.statusSubText.textContent = "Nenhuma execução iniciada.";
+    return;
+  }
+
+  renderTopStatus(state, activePanel);
+}
+
+function renderTopStatus(data, context) {
+  if (context !== activePanel) return;
+
+  setStatus(data.status, data.running, context);
+
+  if (data.running) {
+    setSubStatus(`Consultando ${data.current || 0} de ${data.total || 0}.`);
+  } else if (data.status === "finished") {
+    setSubStatus("Execução concluída.");
+  } else if (data.status === "error") {
+    setSubStatus("A execução terminou com erro. Veja os logs.");
+  } else if (data.status === "stopped") {
+    setSubStatus("Execução interrompida.");
+  } else {
+    setSubStatus("Nenhuma execução iniciada.");
+  }
+}
+
 async function pollStatus() {
   try {
-    const data = await requestJson("/api/status");
+    const [waybillData, podData] = await Promise.all([
+      requestJson("/api/status"),
+      requestJson("/api/pod/status"),
+    ]);
 
-    setStatus(data.status, data.running);
-    updateProgress(data.current, data.total);
-    renderLogs(data.logs || []);
-    renderResults(data.results || []);
+    lastWaybillStatus = waybillData;
+    lastPodStatus = podData;
 
-    if (data.running) {
-      setSubStatus(`Consultando ${data.current || 0} de ${data.total || 0}.`);
-    } else if (data.status === "finished") {
-      setSubStatus("Execução concluída.");
-    } else if (data.status === "error") {
-      setSubStatus("A execução terminou com erro. Veja os logs.");
-    } else if (data.status === "stopped") {
-      setSubStatus("Execução interrompida.");
-    }
+    setStatus(waybillData.status, waybillData.running, "waybill");
+    updateProgress(waybillData.current, waybillData.total, "waybill");
+    renderLogs(waybillData.logs || [], "waybill");
+    renderResults(waybillData.results || []);
 
+    setStatus(podData.status, podData.running, "pod");
+    updateProgress(podData.current, podData.total, "pod");
+    renderLogs(podData.logs || [], "pod");
+    renderPodResults(podData.results || []);
+
+    renderTopStatus(activePanel === "pod" ? podData : waybillData, activePanel);
   } catch (error) {
     console.error(error);
   }
@@ -348,17 +636,18 @@ function startPolling() {
 
 async function startAutomation() {
   try {
+    syncCredentialsFrom("waybill");
     await saveConfig(false);
 
     els.startBtn.disabled = true;
     els.stopBtn.disabled = false;
 
-    setStatus("running", true);
+    setStatus("running", true, "waybill");
     setSubStatus("Iniciando Chrome e perfil clonado...");
 
     await requestJson("/api/start", {
       method: "POST",
-      body: JSON.stringify(collectPayload()),
+      body: JSON.stringify(collectWaybillPayload()),
     });
 
     startPolling();
@@ -366,6 +655,30 @@ async function startAutomation() {
     alert(error.message || "Erro ao iniciar automação.");
     els.startBtn.disabled = false;
     els.stopBtn.disabled = true;
+  }
+}
+
+async function startPodAutomation() {
+  try {
+    syncCredentialsFrom("pod");
+    await saveConfig(false);
+
+    els.podStartBtn.disabled = true;
+    els.podStopBtn.disabled = false;
+
+    setStatus("running", true, "pod");
+    setSubStatus("Iniciando Chrome e perfil clonado...");
+
+    await requestJson("/api/pod/start", {
+      method: "POST",
+      body: JSON.stringify(collectPodPayload()),
+    });
+
+    startPolling();
+  } catch (error) {
+    alert(error.message || "Erro ao iniciar POD Tracking.");
+    els.podStartBtn.disabled = false;
+    els.podStopBtn.disabled = true;
   }
 }
 
@@ -385,8 +698,25 @@ async function stopAutomation() {
   }
 }
 
-function clearLogsVisual() {
-  els.logsBox.innerHTML = `<div class="empty-log">Visual limpo. Os logs reais continuam no estado da execução.</div>`;
+async function stopPodAutomation() {
+  try {
+    els.podStopBtn.disabled = true;
+    setSubStatus("Solicitando parada...");
+
+    await requestJson("/api/pod/stop", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+
+    startPolling();
+  } catch (error) {
+    alert(error.message || "Erro ao parar POD Tracking.");
+  }
+}
+
+function clearLogsVisual(context = "waybill") {
+  const box = context === "pod" ? els.podLogsBox : els.logsBox;
+  box.innerHTML = `<div class="empty-log">Visual limpo. Os logs reais continuam no estado da execução.</div>`;
 }
 
 function setUpdateStatus(text, isError = false) {
@@ -455,6 +785,39 @@ async function applyUpdate() {
   }
 }
 
+function syncCredentialsFrom(source) {
+  if (source === "pod") {
+    els.username.value = els.podUsername.value;
+    els.password.value = els.podPassword.value;
+    els.savePassword.checked = els.podSavePassword.checked;
+    els.recreateProfile.checked = els.podRecreateProfile.checked;
+    return;
+  }
+
+  els.podUsername.value = els.username.value;
+  els.podPassword.value = els.password.value;
+  els.podSavePassword.checked = els.savePassword.checked;
+  els.podRecreateProfile.checked = els.recreateProfile.checked;
+}
+
+function switchPanel(panel) {
+  activePanel = panel === "pod" ? "pod" : "waybill";
+
+  els.sidebarLinks.forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.panel === activePanel);
+  });
+
+  els.panelWaybill.classList.toggle("active", activePanel === "waybill");
+  els.panelPod.classList.toggle("active", activePanel === "pod");
+
+  updateActiveHeader();
+
+  const activeEl = activePanel === "pod" ? els.panelPod : els.panelWaybill;
+
+  restartAnimation(activeEl, "panel-animating");
+  restartAnimation(document.querySelector(".hero"), "hero-animating");
+}
+
 function setupEvents() {
   [
     els.username,
@@ -463,13 +826,44 @@ function setupEvents() {
     els.savePassword,
     els.recreateProfile,
   ].forEach((el) => {
-    el.addEventListener("input", scheduleSaveConfig);
-    el.addEventListener("change", scheduleSaveConfig);
+    el.addEventListener("input", () => {
+      syncCredentialsFrom("waybill");
+      scheduleSaveConfig();
+    });
+    el.addEventListener("change", () => {
+      syncCredentialsFrom("waybill");
+      scheduleSaveConfig();
+    });
+  });
+
+  [
+    els.podUsername,
+    els.podPassword,
+    els.podIds,
+    els.podSavePassword,
+    els.podRecreateProfile,
+  ].forEach((el) => {
+    el.addEventListener("input", () => {
+      syncCredentialsFrom("pod");
+      scheduleSaveConfig();
+    });
+    el.addEventListener("change", () => {
+      syncCredentialsFrom("pod");
+      scheduleSaveConfig();
+    });
+  });
+
+  els.sidebarLinks.forEach((button) => {
+    button.addEventListener("click", () => switchPanel(button.dataset.panel));
   });
 
   els.startBtn.addEventListener("click", startAutomation);
   els.stopBtn.addEventListener("click", stopAutomation);
-  els.clearLogsBtn.addEventListener("click", clearLogsVisual);
+  els.clearLogsBtn.addEventListener("click", () => clearLogsVisual("waybill"));
+
+  els.podStartBtn.addEventListener("click", startPodAutomation);
+  els.podStopBtn.addEventListener("click", stopPodAutomation);
+  els.podClearLogsBtn.addEventListener("click", () => clearLogsVisual("pod"));
 
   if (els.checkUpdateBtn) {
     els.checkUpdateBtn.addEventListener("click", checkForUpdate);
@@ -484,7 +878,13 @@ function setupEvents() {
     els.password.type = isPassword ? "text" : "password";
   });
 
-  els.exportBtn.addEventListener("click", openExportPreview);
+  els.togglePodPassword.addEventListener("click", () => {
+    const isPassword = els.podPassword.type === "password";
+    els.podPassword.type = isPassword ? "text" : "password";
+  });
+
+  els.exportBtn.addEventListener("click", () => openExportPreview("waybill"));
+  els.podExportBtn.addEventListener("click", () => openExportPreview("pod"));
   els.closeExportModal.addEventListener("click", closeModal);
   els.cancelExportBtn.addEventListener("click", closeModal);
   els.confirmExportBtn.addEventListener("click", confirmExport);
@@ -497,12 +897,19 @@ function setupEvents() {
 }
 
 async function boot() {
+  document.body.classList.add("app-loading");
+
   setupEvents();
 
   await loadConfig();
   await pollStatus();
 
   startPolling();
+
+  requestAnimationFrame(() => {
+    document.body.classList.remove("app-loading");
+    document.body.classList.add("app-ready");
+  });
 }
 
 boot();

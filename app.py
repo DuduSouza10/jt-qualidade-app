@@ -33,6 +33,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 JMS_URL = "https://jmsbr.jtjms-br.com/"
 WAYBILL_API = "https://gw.jtjms-br.com/servicequality/thirdService/waybill/commonWaybillListByWaybillNos"
+POD_TRACKING_API = "https://gw.jtjms-br.com/operatingplatform/podTracking/inner/query/keywordList"
 
 LOGIN_USER_XPATH = (
     '//input[contains(@class, "el-input__inner") '
@@ -64,7 +65,7 @@ DEFAULT_APP_PORT = 5018
 APP_PORT = DEFAULT_APP_PORT
 MAX_LOGS = 1500
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_EXE_NAME = "Verificacao_IDs_JT_Express.exe"
 UPDATER_EXE_NAME = "Atualizador.exe"
 
@@ -117,11 +118,27 @@ def no_cache(response):
 
 state_lock = threading.Lock()
 stop_event = threading.Event()
+pod_stop_event = threading.Event()
 
 current_driver: Optional[webdriver.Chrome] = None
 current_thread: Optional[threading.Thread] = None
+pod_current_driver: Optional[webdriver.Chrome] = None
+pod_current_thread: Optional[threading.Thread] = None
 
 state: Dict[str, Any] = {
+    "running": False,
+    "status": "idle",
+    "logs": [],
+    "results": [],
+    "current": 0,
+    "total": 0,
+    "started_at": None,
+    "finished_at": None,
+}
+
+# Estado separado para a nova automação de POD Tracking.
+# A automação antiga continua usando o bloco `state` acima.
+pod_state: Dict[str, Any] = {
     "running": False,
     "status": "idle",
     "logs": [],
@@ -158,6 +175,7 @@ def default_config() -> Dict[str, Any]:
         "password": "",
         "save_password": False,
         "waybills": "",
+        "pod_ids": "",
         "recreate_profile": False,
     }
 
@@ -182,14 +200,29 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(data: Dict[str, Any]) -> None:
-    save_password = bool(data.get("save_password"))
+    # Preserva campos que não vieram no payload para a sidebar não apagar
+    # as configurações da outra automação.
+    existing: Dict[str, Any] = {}
+
+    if CONFIG_FILE.exists():
+        try:
+            existing = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    save_password = bool(data.get("save_password", existing.get("save_password", False)))
+
+    raw_password = str(data.get("password", ""))
+    if not raw_password and save_password:
+        raw_password = decode_password(str(existing.get("password_encoded", "")))
 
     cfg = {
-        "username": str(data.get("username", "")),
+        "username": str(data.get("username", existing.get("username", ""))),
         "save_password": save_password,
-        "password_encoded": encode_password(str(data.get("password", ""))) if save_password else "",
-        "waybills": str(data.get("waybills", "")),
-        "recreate_profile": bool(data.get("recreate_profile", False)),
+        "password_encoded": encode_password(raw_password) if save_password else "",
+        "waybills": str(data.get("waybills", existing.get("waybills", ""))),
+        "pod_ids": str(data.get("pod_ids", existing.get("pod_ids", ""))),
+        "recreate_profile": bool(data.get("recreate_profile", existing.get("recreate_profile", False))),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -239,6 +272,55 @@ def snapshot_state() -> Dict[str, Any]:
 def reset_runtime_state(total: int = 0) -> None:
     with state_lock:
         state.update(
+            {
+                "running": True,
+                "status": "running",
+                "logs": [],
+                "results": [],
+                "current": 0,
+                "total": total,
+                "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": None,
+            }
+        )
+
+
+# ============================================================
+# ESTADO / LOGS - POD TRACKING
+# ============================================================
+
+def pod_log(message: str, level: str = "info") -> None:
+    line = {
+        "time": now_text(),
+        "message": message,
+        "level": level,
+    }
+
+    with state_lock:
+        pod_state["logs"].append(line)
+
+        if len(pod_state["logs"]) > MAX_LOGS:
+            pod_state["logs"] = pod_state["logs"][-MAX_LOGS:]
+
+
+def pod_set_state(**kwargs: Any) -> None:
+    with state_lock:
+        pod_state.update(kwargs)
+
+
+def pod_append_result(row: Dict[str, Any]) -> None:
+    with state_lock:
+        pod_state["results"].append(row)
+
+
+def pod_snapshot_state() -> Dict[str, Any]:
+    with state_lock:
+        return json.loads(json.dumps(pod_state, ensure_ascii=False))
+
+
+def pod_reset_runtime_state(total: int = 0) -> None:
+    with state_lock:
+        pod_state.update(
             {
                 "running": True,
                 "status": "running",
@@ -1125,8 +1207,483 @@ def query_waybill(
 
 
 # ============================================================
-# WORKER
+# REQUESTS JMS - POD TRACKING
 # ============================================================
+
+def format_datetime_br(value: Any) -> str:
+    text = str(value or "").strip()
+
+    if not text:
+        return ""
+
+    normalized = text.replace("T", " ").replace("Z", "").strip()
+    normalized = normalized.split(".")[0]
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+    ):
+        try:
+            dt = datetime.strptime(normalized, fmt)
+            return dt.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            continue
+
+    return text
+
+
+def render_pod_template(template: Any, detail: Dict[str, Any]) -> str:
+    """
+    Converte:
+    [$[scanNetworkName]] A verificação..., escaneador é [$[scanByCode]-$[scanByName]]
+    
+    Em:
+    [UDI -MG] A verificação..., escaneador é [01492975-GUSTAVO...]
+    """
+    text = str(template or "").strip()
+
+    if not text:
+        return ""
+
+    def replace_token(match: re.Match) -> str:
+        key = match.group(1).strip()
+        return format_value(detail.get(key, ""))
+
+    return re.sub(r"\$\[([A-Za-z0-9_]+)\]", replace_token, text)
+
+
+def try_json_loads(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+
+    return value
+
+
+def extract_first_pod_detail(response_json: Any) -> Optional[Dict[str, Any]]:
+    """
+    Pega exatamente a lógica do Preview do Network:
+
+    data[0].details[0]
+
+    Mas também tem fallback recursivo caso o backend venha embrulhado em:
+    result, rows, list, page, records, etc.
+    """
+
+    response_json = try_json_loads(response_json)
+
+    # CASO PRINCIPAL:
+    # {
+    #   "data": [
+    #       {
+    #           "details": [
+    #               {... pegar este ...}
+    #           ]
+    #       }
+    #   ]
+    # }
+    if isinstance(response_json, dict):
+        data = try_json_loads(response_json.get("data"))
+
+        if isinstance(data, list) and data:
+            first_data = try_json_loads(data[0])
+
+            if isinstance(first_data, dict):
+                details = try_json_loads(first_data.get("details"))
+
+                if isinstance(details, list) and details:
+                    first_detail = try_json_loads(details[0])
+
+                    if isinstance(first_detail, dict):
+                        return first_detail
+
+                if isinstance(details, dict):
+                    return details
+
+                # Caso o próprio data[0] já seja o detalhe
+                if any(
+                    first_data.get(k) is not None
+                    for k in (
+                        "scanTime",
+                        "scanTypeName",
+                        "remark1",
+                        "scanNetworkName",
+                        "podTemplateContent",
+                        "waybillTrackingContent",
+                    )
+                ):
+                    return first_data
+
+        if isinstance(data, dict):
+            details = try_json_loads(data.get("details"))
+
+            if isinstance(details, list) and details:
+                first_detail = try_json_loads(details[0])
+
+                if isinstance(first_detail, dict):
+                    return first_detail
+
+            if isinstance(details, dict):
+                return details
+
+    # Fallback recursivo para qualquer formato diferente
+    def walk(obj: Any) -> Optional[Dict[str, Any]]:
+        obj = try_json_loads(obj)
+
+        if isinstance(obj, dict):
+            details = try_json_loads(obj.get("details"))
+
+            if isinstance(details, list) and details:
+                first_detail = try_json_loads(details[0])
+
+                if isinstance(first_detail, dict):
+                    return first_detail
+
+            if isinstance(details, dict):
+                return details
+
+            if any(
+                obj.get(k) is not None
+                for k in (
+                    "scanTime",
+                    "scanTypeName",
+                    "remark1",
+                    "scanNetworkName",
+                    "podTemplateContent",
+                    "waybillTrackingContent",
+                )
+            ):
+                return obj
+
+            for value in obj.values():
+                found = walk(value)
+
+                if found:
+                    return found
+
+        elif isinstance(obj, list):
+            for item in obj:
+                found = walk(item)
+
+                if found:
+                    return found
+
+        return None
+
+    return walk(response_json)
+
+
+def save_pod_debug_response(
+    waybill: str,
+    payload: Any,
+    status_code: Any,
+    response_data: Any,
+    attempt_name: str = "",
+) -> str:
+    return ""
+
+
+def pod_request_payloads(waybill: str) -> List[Dict[str, Any]]:
+    waybill = str(waybill).strip()
+
+    return [
+        {
+            "name": "payload_real_network",
+            "payload": {
+                "keywordList": [waybill],
+                "trackingTypeEnum": "WAYBILL",
+                "countryId": "1",
+            },
+        }
+    ]
+
+
+def build_pod_row_from_detail(
+    waybill: str,
+    detail: Dict[str, Any],
+    http_status: Any = "",
+) -> Dict[str, Any]:
+    raw_template = (
+        detail.get("podTemplateContent")
+        or detail.get("waybillTrackingContent")
+        or ""
+    )
+
+    rendered_template = render_pod_template(raw_template, detail)
+
+    return {
+        "waybillNo": format_value(
+            detail.get("waybillNo")
+            or detail.get("billCode")
+            or waybill
+        ),
+        "scanTime": format_datetime_br(detail.get("scanTime")),
+        "scanTypeName": format_value(detail.get("scanTypeName")),
+        "remark1": format_value(detail.get("remark1")),
+        "scanNetworkName": format_value(detail.get("scanNetworkName")),
+        "podTemplateContent": rendered_template,
+        "status": "ok",
+        "message": "Consulta concluída.",
+        "http_status": http_status,
+    }
+
+
+def browser_fetch_json(
+    driver: webdriver.Chrome,
+    url: str,
+    method: str = "POST",
+    headers: Optional[Dict[str, str]] = None,
+    body: Any = None,
+    timeout_ms: int = 45000,
+) -> Dict[str, Any]:
+    safe_headers = {}
+
+    for key, value in (headers or {}).items():
+        k = str(key)
+
+        # Headers que o navegador não deixa setar manualmente
+        if k.lower() in (
+            "user-agent",
+            "origin",
+            "referer",
+            "host",
+            "cookie",
+            "content-length",
+            "connection",
+            "accept-encoding",
+        ):
+            continue
+
+        safe_headers[k] = str(value)
+
+    if body is not None:
+        safe_headers.setdefault("Content-Type", "application/json;charset=UTF-8")
+
+    return driver.execute_async_script(
+        """
+        const url = arguments[0];
+        const method = arguments[1];
+        const headers = arguments[2] || {};
+        const body = arguments[3];
+        const timeoutMs = arguments[4] || 45000;
+        const callback = arguments[arguments.length - 1];
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        const options = {
+            method: method,
+            headers: headers,
+            credentials: "include",
+            signal: controller.signal
+        };
+
+        if (body !== null && body !== undefined) {
+            options.body = JSON.stringify(body);
+        }
+
+        fetch(url, options)
+            .then(async (response) => {
+                clearTimeout(timer);
+
+                const text = await response.text();
+                let parsed = null;
+
+                try {
+                    parsed = JSON.parse(text);
+                } catch (e) {
+                    parsed = null;
+                }
+
+                callback({
+                    ok: response.ok,
+                    status: response.status,
+                    url: response.url,
+                    text: text.slice(0, 10000),
+                    json: parsed
+                });
+            })
+            .catch((error) => {
+                clearTimeout(timer);
+
+                callback({
+                    ok: false,
+                    status: 0,
+                    error: String(error),
+                    text: "",
+                    json: null
+                });
+            });
+        """,
+        url,
+        method,
+        safe_headers,
+        body,
+        timeout_ms,
+    )
+
+def query_pod_tracking(
+    session: requests.Session,
+    headers: Dict[str, str],
+    waybill: str,
+) -> Dict[str, Any]:
+    request_headers = dict(headers)
+
+    # Garante o nome exato do header igual ao Network
+    token = (
+        request_headers.get("authToken")
+        or request_headers.get("authtoken")
+        or request_headers.get("Authorization")
+        or request_headers.get("authorization")
+        or ""
+    )
+
+    request_headers.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-GB,en;q=0.8",
+            "Cache-Control": "max-age=2, must-revalidate",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": "https://jmsbr.jtjms-br.com",
+            "Referer": "https://jmsbr.jtjms-br.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "lang": "PT",
+            "langType": "PT",
+            "routeName": "trackingExpress",
+            "routerNameList": "%E6%93%8D%E4%BD%9C%E5%B9%B3%E5%8F%B0%3E%E5%BF%AB%E4%BB%B6%E6%9F%A5%E8%AF%A2%3E%E5%BF%AB%E4%BB%B6%E8%B7%9F%E8%B8%AA",
+            "timezone": "GMT-0300",
+        }
+    )
+
+    if token:
+        request_headers.pop("authtoken", None)
+        request_headers.pop("Authorization", None)
+        request_headers.pop("authorization", None)
+        request_headers["authToken"] = token
+
+    base_row: Dict[str, Any] = {
+        "waybillNo": waybill,
+        "scanTime": "",
+        "scanTypeName": "",
+        "remark1": "",
+        "scanNetworkName": "",
+        "podTemplateContent": "",
+        "status": "erro",
+        "message": "Não foi possível consultar o POD Tracking.",
+        "http_status": "",
+    }
+
+    last_message = ""
+    last_status: Any = ""
+    last_debug_path = ""
+
+    try:
+        for attempt in pod_request_payloads(waybill):
+            attempt_name = attempt["name"]
+            payload = attempt["payload"]
+
+            response = session.post(
+                POD_TRACKING_API,
+                headers=request_headers,
+                json=payload,
+                timeout=45,
+            )
+
+            last_status = response.status_code
+
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {
+                    "raw": response.text[:5000],
+                }
+
+            try:
+                last_debug_path = save_pod_debug_response(
+                    waybill=waybill,
+                    payload=payload,
+                    status_code=response.status_code,
+                    response_data=response_data,
+                    attempt_name=attempt_name,
+                )
+            except TypeError:
+                last_debug_path = save_pod_debug_response(
+                    waybill=waybill,
+                    payload=payload,
+                    status_code=response.status_code,
+                    response_data=response_data,
+                )
+
+            if response.status_code in (401, 403):
+                base_row["http_status"] = response.status_code
+                base_row["message"] = (
+                    f"Sem autorização ({response.status_code}). "
+                    "Token pode ter expirado."
+                )
+                return base_row
+
+            msg = deep_find_message(response_data)
+
+            if msg:
+                last_message = msg
+
+            if not response.ok:
+                continue
+
+            detail = extract_first_pod_detail(response_data)
+
+            if not detail:
+                continue
+
+            row = build_pod_row_from_detail(
+                waybill=waybill,
+                detail=detail,
+                http_status=response.status_code,
+            )
+
+            if any(
+                [
+                    row.get("scanTime"),
+                    row.get("scanTypeName"),
+                    row.get("remark1"),
+                    row.get("scanNetworkName"),
+                    row.get("podTemplateContent"),
+                ]
+            ):
+                row["status"] = "ok"
+                row["message"] = "Consulta concluída usando payload real do Network."
+                return row
+
+            row["status"] = "aviso"
+            row["message"] = (
+                "Encontrei details[0], mas os campos esperados vieram vazios."
+            )
+            return row
+
+        base_row["status"] = "aviso"
+        base_row["http_status"] = last_status
+        base_row["message"] = (
+            last_message
+            or f"HTTP {last_status}. Não encontrei data[0].details[0] no retorno."
+        )
+
+        if last_debug_path:
+            base_row["message"] += f" Debug salvo em: {last_debug_path}"
+
+        return base_row
+
+    except requests.RequestException as exc:
+        base_row["message"] = f"Falha na request POD Tracking: {exc}"
+        return base_row
+
 
 def automation_worker(payload: Dict[str, Any]) -> None:
     global current_driver
@@ -1194,11 +1751,13 @@ def automation_worker(payload: Dict[str, Any]) -> None:
             row = query_waybill(session, headers, waybill)
             append_result(row)
 
-            if row["status"] == "ok":
-                log(f"✅ {waybill} | Conteúdo: {row['goodsName']} | NF: {row['insuredAmount']}")
+            if row.get("status") == "ok":
+                log(
+                    f"✅ {waybill} | Conteúdo: {row.get('goodsName', '')} | NF: {row.get('insuredAmount', '')}"
+                )
             else:
-                level = "warn" if row["status"] == "aviso" else "error"
-                log(f"⚠️ {waybill} | {row['message']}", level)
+                level = "warn" if row.get("status") == "aviso" else "error"
+                log(f"⚠️ {waybill} | {row.get('message', '')}", level)
 
             time.sleep(0.35)
 
@@ -1230,6 +1789,119 @@ def automation_worker(payload: Dict[str, Any]) -> None:
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
+# ============================================================
+# WORKER - POD TRACKING
+# ============================================================
+
+def pod_automation_worker(payload: Dict[str, Any]) -> None:
+    global pod_current_driver
+
+    driver: Optional[webdriver.Chrome] = None
+
+    try:
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        recreate_profile = bool(payload.get("recreate_profile"))
+        ids = parse_waybills(str(payload.get("pod_ids", "")))
+
+        if not ids:
+            raise RuntimeError("Nenhum ID válido foi informado para POD Tracking.")
+
+        pod_set_state(total=len(ids))
+
+        pod_log(f"🚀 Iniciando POD Tracking para {len(ids)} ID(s).")
+
+        ensure_robot_profile(recreate=recreate_profile)
+
+        if pod_stop_event.is_set():
+            raise RuntimeError("Automação interrompida antes de abrir o Chrome.")
+
+        pod_log("🌐 Abrindo Chrome com o perfil fixo clonado...")
+
+        driver = create_chrome_driver()
+        pod_current_driver = driver
+
+        token, user_data, _storage = login_and_get_auth(driver, username, password)
+
+        if user_data:
+            staff = user_data.get("staffNo") or user_data.get("userCode") or ""
+            network = user_data.get("networkCode") or ""
+            pod_log(f"👤 Dados detectados no JMS: staffNo={staff} | networkCode={network}")
+        else:
+            pod_log(
+                "ℹ️ Token encontrado, mas userData não foi localizado no localStorage.",
+                "warn",
+            )
+
+        session = selenium_cookies_to_requests(driver)
+        headers = build_headers(driver, token, user_data)
+
+        pod_log("✅ Login confirmado e dados de autenticação capturados.")
+        pod_log("🔒 Fechando Chrome. As consultas POD continuarão em segundo plano...")
+
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+        pod_current_driver = None
+        driver = None
+
+        pod_log("🌙 Chrome fechado. Iniciando requests do POD Tracking em background...")
+
+        for index, waybill in enumerate(ids, start=1):
+            if pod_stop_event.is_set():
+                pod_log("🛑 Parada solicitada. Encerrando loop de consultas POD...", "warn")
+                pod_set_state(status="stopped")
+                break
+
+            pod_set_state(current=index)
+
+            pod_log(f"🔎 Consultando POD {index}/{len(ids)}: {waybill}")
+
+            row = query_pod_tracking(session, headers, waybill)
+            pod_append_result(row)
+
+            if row.get("status") == "ok":
+                pod_log(
+                    f"✅ {row.get('waybillNo', waybill)} | "
+                    f"Scan: {row.get('scanTime', '')} | "
+                    f"Tipo: {row.get('scanTypeName', '')} | "
+                    f"Rede: {row.get('scanNetworkName', '')}"
+                )
+            else:
+                level = "warn" if row.get("status") == "aviso" else "error"
+                pod_log(f"⚠️ {waybill} | {row.get('message', '')}", level)
+
+            time.sleep(0.35)
+
+        if not pod_stop_event.is_set():
+            pod_set_state(status="finished", current=len(ids))
+            pod_log("🏁 Automação POD finalizada.")
+
+    except WebDriverException as exc:
+        pod_set_state(status="error")
+        pod_log(f"❌ ERRO DO CHROME/SELENIUM: {exc}", "error")
+
+    except Exception as exc:
+        pod_set_state(status="error")
+        pod_log(f"❌ ERRO: {exc}", "error")
+        pod_log(traceback.format_exc(), "error")
+
+    finally:
+        try:
+            if driver:
+                driver.quit()
+                pod_log("🔒 Chrome do robô fechado.")
+        except Exception:
+            pass
+
+        pod_current_driver = None
+
+        pod_set_state(
+            running=False,
+            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
 
 # ============================================================
 # AUTOATUALIZACAO
@@ -1559,6 +2231,53 @@ def api_status():
     return jsonify(snapshot_state())
 
 
+@app.post("/api/pod/start")
+def api_pod_start():
+    global pod_current_thread
+
+    payload = request.get_json(silent=True) or {}
+
+    with state_lock:
+        if pod_state.get("running"):
+            return jsonify({"ok": False, "message": "A automação POD já está rodando."}), 409
+
+        if state.get("running"):
+            return jsonify({"ok": False, "message": "A automação antiga está rodando. Finalize antes de iniciar o POD Tracking."}), 409
+
+    ids = parse_waybills(str(payload.get("pod_ids", "")))
+
+    if not ids:
+        return jsonify({"ok": False, "message": "Informe pelo menos um ID válido para POD Tracking."}), 400
+
+    save_config(payload)
+
+    pod_stop_event.clear()
+    pod_reset_runtime_state(total=len(ids))
+
+    pod_current_thread = threading.Thread(
+        target=pod_automation_worker,
+        args=(payload,),
+        daemon=True,
+    )
+
+    pod_current_thread.start()
+
+    return jsonify({"ok": True, "total": len(ids)})
+
+
+@app.post("/api/pod/stop")
+def api_pod_stop():
+    pod_stop_event.set()
+    pod_log("🛑 Parada solicitada pelo usuário.", "warn")
+
+    return jsonify({"ok": True})
+
+
+@app.get("/api/pod/status")
+def api_pod_status():
+    return jsonify(pod_snapshot_state())
+
+
 
 @app.get("/api/export/preview")
 def api_export_preview():
@@ -1864,6 +2583,207 @@ def api_export_file():
         }
     )
 
+
+
+# ============================================================
+# EXPORTAÇÃO XLSX - POD TRACKING
+# ============================================================
+
+def generate_pod_export_filename() -> str:
+    now = datetime.now()
+    date_part = now.strftime("%d-%m-%y")
+    time_part = now.strftime("%H-%M")
+
+    return f"POD Tracking exportado - {date_part} - {time_part}.xlsx"
+
+
+def get_pod_export_rows() -> List[Dict[str, Any]]:
+    snap = pod_snapshot_state()
+    results = snap.get("results", [])
+
+    rows: List[Dict[str, Any]] = []
+
+    for row in results:
+        rows.append(
+            {
+                "waybillNo": row.get("waybillNo", ""),
+                "scanTime": row.get("scanTime", ""),
+                "scanTypeName": row.get("scanTypeName", ""),
+                "remark1": row.get("remark1", ""),
+                "scanNetworkName": row.get("scanNetworkName", ""),
+                "podTemplateContent": row.get("podTemplateContent", ""),
+            }
+        )
+
+    return rows
+
+# ============================================================
+# SOBRESCRITA DE CABEÇALHOS - POD TRACKING
+# Não remove a função antiga; apenas redefine com os nomes finais.
+# ============================================================
+
+def build_pod_xlsx_sheet_xml(rows: List[Dict[str, Any]]) -> str:
+    headers = [
+        "ID do pacote",
+        "Tempo de Digitalização",
+        "Tipo de Bipagem",
+        "Motivo da Bipagem",
+        "Base Responsável",
+        "Descrição da Etapa de Bipagem",
+    ]
+
+    xml_rows: List[str] = []
+
+    header_cells = [
+        make_inline_string_cell(1, index, header, 1)
+        for index, header in enumerate(headers, start=1)
+    ]
+
+    xml_rows.append(
+        f'<row r="1" ht="24" customHeight="1">{"".join(header_cells)}</row>'
+    )
+
+    for row_index, row in enumerate(rows, start=2):
+        values = [
+            row.get("waybillNo", ""),
+            row.get("scanTime", ""),
+            row.get("scanTypeName", ""),
+            row.get("remark1", ""),
+            row.get("scanNetworkName", ""),
+            row.get("podTemplateContent", ""),
+        ]
+
+        cells = [
+            make_inline_string_cell(row_index, col_index, value, 2)
+            for col_index, value in enumerate(values, start=1)
+        ]
+
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    last_row = max(len(rows) + 1, 1)
+
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetViews>
+    <sheetView workbookViewId="0">
+      <pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>
+      <selection pane="bottomLeft" activeCell="A2" sqref="A2"/>
+    </sheetView>
+  </sheetViews>
+  <cols>
+    <col min="1" max="1" width="24" customWidth="1"/>
+    <col min="2" max="2" width="26" customWidth="1"/>
+    <col min="3" max="3" width="30" customWidth="1"/>
+    <col min="4" max="4" width="34" customWidth="1"/>
+    <col min="5" max="5" width="28" customWidth="1"/>
+    <col min="6" max="6" width="95" customWidth="1"/>
+  </cols>
+  <sheetData>
+    {''.join(xml_rows)}
+  </sheetData>
+  <autoFilter ref="A1:F{last_row}"/>
+  <pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>
+</worksheet>"""
+
+def create_pod_xlsx_file(rows: List[Dict[str, Any]], output_path: Path) -> None:
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"""
+
+    root_rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>"""
+
+    workbook_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="POD Tracking" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"""
+
+    workbook_rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"""
+
+    app_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+            xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>JMS Automation</Application>
+</Properties>"""
+
+    core_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+                   xmlns:dc="http://purl.org/dc/elements/1.1/"
+                   xmlns:dcterms="http://purl.org/dc/terms/"
+                   xmlns:dcmitype="http://purl.org/dc/dcmitype/"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:creator>JMS Automation</dc:creator>
+  <cp:lastModifiedBy>JMS Automation</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{created_at}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{created_at}</dcterms:modified>
+</cp:coreProperties>"""
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as xlsx:
+        xlsx.writestr("[Content_Types].xml", content_types_xml)
+        xlsx.writestr("_rels/.rels", root_rels_xml)
+        xlsx.writestr("docProps/app.xml", app_xml)
+        xlsx.writestr("docProps/core.xml", core_xml)
+        xlsx.writestr("xl/workbook.xml", workbook_xml)
+        xlsx.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        xlsx.writestr("xl/styles.xml", build_xlsx_styles_xml())
+        xlsx.writestr("xl/worksheets/sheet1.xml", build_pod_xlsx_sheet_xml(rows))
+
+
+
+@app.get("/api/pod/export/preview")
+def api_pod_export_preview():
+    rows = get_pod_export_rows()
+    filename = generate_pod_export_filename()
+
+    return jsonify(
+        {
+            "ok": True,
+            "filename": filename,
+            "folder": str(EXPORTS_DIR),
+            "total": len(rows),
+            "rows": rows,
+        }
+    )
+
+
+@app.post("/api/pod/export")
+def api_pod_export_file():
+    rows = get_pod_export_rows()
+
+    if not rows:
+        return jsonify({"ok": False, "message": "Não há resultados POD para exportar."}), 400
+
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = generate_pod_export_filename()
+    output_path = EXPORTS_DIR / filename
+
+    create_pod_xlsx_file(rows, output_path)
+
+    pod_log(f"📁 XLSX POD exportado com sucesso: {output_path}")
+
+    return jsonify({"ok": True, "filename": filename, "path": str(output_path), "total": len(rows)})
 
 
 def find_free_port(start_port: int = 5017, attempts: int = 80) -> int:
