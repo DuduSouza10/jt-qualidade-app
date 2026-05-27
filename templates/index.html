@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Verificação de ID's - J&T Express</title>
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ cache_id }}" />
+</head> 
+<body>
+  <div class="page-bg">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+  </div>
+
+  <main class="app-shell">
+    <header class="hero">
+    <div class="hero-main">
+        <div class="logo-row">
+        <img
+            src="{{ url_for('static', filename='icons/jt-logo.svg') }}?v={{ cache_id }}"
+            alt="J&T Express"
+            class="jt-logo"
+        />
+
+        <div class="brand-pill">
+            <span class="brand-dot"></span>
+            JMS Automation
+        </div>
+        </div>
+
+        <h1>Verificação de ID's</h1>
+
+        <p>
+        O Chrome será aberto apenas para login e captcha. Após detectar o token,
+        o navegador será fechado e as verificações seguirão em segundo plano.
+        </p>
+    </div>
+
+      <div class="hero-card">
+        <span class="hero-label">Status</span>
+        <strong id="statusText">Aguardando</strong>
+        <small id="statusSubText">Nenhuma execução iniciada.</small>
+      </div>
+    </header>
+
+    <section class="layout-grid">
+      <section class="card input-card">
+        <div class="card-header">
+          <div>
+            <span class="section-kicker">Configuração</span>
+            <h2>Login e consulta</h2>
+          </div>
+        </div>
+
+        <div class="fields-grid">
+          <label class="field">
+            <span>Usuário JMS</span>
+            <input id="username" type="text" placeholder="Digite o usuário" autocomplete="off" />
+          </label>
+
+          <label class="field">
+            <span>Senha JMS</span>
+            <div class="password-wrap">
+              <input id="password" type="password" placeholder="Digite a senha" autocomplete="off" />
+              <button id="togglePassword" type="button" title="Mostrar/ocultar senha">👁</button>
+            </div>
+          </label>
+        </div>
+
+        <label class="field ids-field">
+          <span>WaybillNos</span>
+          <textarea
+            id="waybills"
+            placeholder="Cole os IDs aqui, um por linha. Exemplo:
+888030685265959
+888030685265960
+888030685265961"></textarea>
+        </label>
+
+        <div class="checks-row">
+          <label class="check-card">
+            <input id="savePassword" type="checkbox" />
+            <span>
+              <strong>Salvar senha neste computador</strong>
+              <small>Salva no config.json em Base64.</small>
+            </span>
+          </label>
+
+          <label class="check-card">
+            <input id="recreateProfile" type="checkbox" />
+            <span>
+              <strong>Recriar perfil clonado</strong>
+              <small>Use se o Chrome clonado der erro ou deslogar.</small>
+            </span>
+          </label>
+        </div>
+
+        <div class="actions-row">
+          <button id="startBtn" class="btn btn-primary" type="button">
+            Iniciar automação
+          </button>
+
+          <button id="stopBtn" class="btn btn-secondary" type="button" disabled>
+            Parar
+          </button>
+
+          <button id="exportBtn" class="btn btn-ghost disabled" type="button">
+            Exportar XLSX
+          </button>
+        </div>
+
+        <div class="update-box">
+          <div>
+            <strong>Atualização do sistema</strong>
+            <small id="updateStatus">Clique em verificar para consultar a última versão no GitHub.</small>
+          </div>
+
+          <div class="update-actions">
+            <button id="checkUpdateBtn" class="btn btn-secondary" type="button">
+              Verificar atualização
+            </button>
+
+            <button id="applyUpdateBtn" class="btn btn-primary" type="button" disabled>
+              Atualizar sistema
+            </button>
+          </div>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress-info">
+            <span id="progressLabel">0 de 0</span>
+            <span id="progressPercent">0%</span>
+          </div>
+
+          <div class="progress-bar">
+            <div id="progressFill"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <div class="card-header">
+          <div>
+            <span class="section-kicker">Execução</span>
+            <h2>Logs em tempo real</h2>
+          </div>
+
+          <button id="clearLogsBtn" class="mini-btn" type="button">
+            Limpar visual
+          </button>
+        </div>
+
+        <div id="logsBox" class="logs-box">
+          <div class="empty-log">Os logs vão aparecer aqui quando iniciar.</div>
+        </div>
+      </section>
+    </section>
+
+    <section class="card results-card">
+      <div class="card-header">
+        <div>
+          <span class="section-kicker">Resultado</span>
+          <h2>Dados coletados</h2>
+        </div>
+
+        <span id="resultsCount" class="counter-pill">0 registros</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Waybill</th>
+              <th>Conteúdo do pacote</th>
+              <th>Valor da nota fiscal</th>
+              <th>Status</th>
+              <th>Mensagem</th>
+            </tr>
+          </thead>
+
+          <tbody id="resultsBody">
+            <tr class="empty-row">
+              <td colspan="5">Nenhum dado coletado ainda.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div id="exportModal" class="modal-backdrop hidden">
+        <div class="export-modal">
+            <div class="modal-header">
+            <div>
+                <span class="section-kicker">Exportação</span>
+                <h2>Preview do XLSX</h2>
+            </div>
+
+            <button id="closeExportModal" class="modal-close" type="button">×</button>
+            </div>
+
+            <div class="export-info">
+            <div>
+                <span>Arquivo</span>
+                <strong id="exportFileName">-</strong>
+            </div>
+
+            <div>
+                <span>Pasta</span>
+                <strong id="exportFolder">-</strong>
+            </div>
+
+            <div>
+                <span>Total</span>
+                <strong id="exportTotal">0 registros</strong>
+            </div>
+            </div>
+
+            <div class="preview-table-wrap">
+            <table>
+                <thead>
+                <tr>
+                    <th>Códigos de Rastreio</th>
+                    <th>Conteúdo do Pacote</th>
+                    <th>Valor da NF</th>
+                </tr>
+                </thead>
+
+                <tbody id="exportPreviewBody">
+                <tr class="empty-row">
+                    <td colspan="3">Nenhum dado para exportar.</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+
+            <div class="modal-actions">
+            <button id="cancelExportBtn" class="btn btn-secondary" type="button">
+                Cancelar
+            </button>
+
+            <button id="confirmExportBtn" class="btn btn-primary" type="button">
+                Confirmar exportação
+            </button>
+            </div>
+        </div>
+    </div>
+
+    <footer class="footer">
+      Developed by: Eduardo Rodrigues
+    </footer>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/script.js') }}?v={{ cache_id }}"></script>
+</body>
+</html>
