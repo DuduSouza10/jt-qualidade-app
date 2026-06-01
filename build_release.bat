@@ -3,13 +3,21 @@ setlocal enabledelayedexpansion
 title Build Release - JMS Coletor Waybill
 cd /d "%~dp0"
 
+set "APP_FOLDER_NAME=JMS_Coletor_Waybill"
+set "APP_EXE_BASENAME=Verificacao_IDs_JT_Express"
+set "APP_EXE_NAME=%APP_EXE_BASENAME%.exe"
+set "RAW_DIST=dist\%APP_EXE_BASENAME%"
+set "APP_DIST=dist\%APP_FOLDER_NAME%"
+
 echo.
 echo ============================================================
 echo BUILD DE RELEASE - JMS COLETOR WAYBILL
+echo Pasta principal da release: %APP_FOLDER_NAME%
+echo EXE principal: %APP_EXE_NAME%
 echo ============================================================
 echo.
 
-set /p APP_VERSION=Digite a versao da release. Exemplo 1.0.1: 
+set /p APP_VERSION=Digite a versao da release. Exemplo 1.1.0: 
 
 if "%APP_VERSION%"=="" (
   echo Versao nao informada.
@@ -19,7 +27,7 @@ if "%APP_VERSION%"=="" (
 
 echo.
 echo Fechando processos antigos do sistema, se estiverem abertos...
-taskkill /F /IM "Verificacao_IDs_JT_Express.exe" >nul 2>nul
+taskkill /F /IM "%APP_EXE_NAME%" >nul 2>nul
 taskkill /F /IM "Atualizador.exe" >nul 2>nul
 timeout /t 2 /nobreak >nul
 
@@ -57,12 +65,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo Garantindo PyInstaller atualizado...
-python -m pip install --upgrade pyinstaller
+echo Garantindo PyInstaller e Selenium atualizados...
+python -m pip install --upgrade pyinstaller selenium
 
 if errorlevel 1 (
   echo.
-  echo ERRO ao instalar/atualizar PyInstaller.
+  echo ERRO ao instalar/atualizar PyInstaller/Selenium.
   pause
   exit /b 1
 )
@@ -123,7 +131,7 @@ python -m PyInstaller ^
   --onedir ^
   --noconsole ^
   --clean ^
-  --name "Verificacao_IDs_JT_Express" ^
+  --name "%APP_EXE_BASENAME%" ^
   --add-data "templates;templates" ^
   --add-data "static;static" ^
   --collect-all webview ^
@@ -147,11 +155,21 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "APP_DIST=dist\Verificacao_IDs_JT_Express"
-
-if not exist "%APP_DIST%\Verificacao_IDs_JT_Express.exe" (
+if not exist "%RAW_DIST%\%APP_EXE_NAME%" (
   echo.
-  echo ERRO: EXE principal nao encontrado em %APP_DIST%.
+  echo ERRO: EXE principal nao encontrado em %RAW_DIST%.
+  pause
+  exit /b 1
+)
+
+echo.
+echo Renomeando pasta principal da aplicacao para %APP_FOLDER_NAME%...
+if exist "%APP_DIST%" rmdir /s /q "%APP_DIST%" 2>nul
+ren "%RAW_DIST%" "%APP_FOLDER_NAME%"
+
+if not exist "%APP_DIST%\%APP_EXE_NAME%" (
+  echo.
+  echo ERRO: Pasta final nao encontrada em %APP_DIST%.
   pause
   exit /b 1
 )
@@ -161,11 +179,58 @@ echo Copiando arquivos de atualizacao para a pasta final...
 copy /y "dist\Atualizador.exe" "%APP_DIST%\Atualizador.exe" >nul
 copy /y "version.json" "%APP_DIST%\version.json" >nul
 copy /y "update_config.json" "%APP_DIST%\update_config.json" >nul
-copy /y "README_ATUALIZACAO.md" "%APP_DIST%\README_ATUALIZACAO.md" >nul
+if exist "README_ATUALIZACAO.md" copy /y "README_ATUALIZACAO.md" "%APP_DIST%\README_ATUALIZACAO.md" >nul
 
 if not exist "%APP_DIST%\Atualizador.exe" (
   echo.
   echo ERRO: Atualizador.exe nao foi copiado para a pasta final.
+  pause
+  exit /b 1
+)
+
+echo.
+echo Copiando templates e static atualizados ao lado do EXE...
+echo Isso garante que HTML/CSS/JS novos, incluindo animacoes, vao junto na release.
+rmdir /s /q "%APP_DIST%\templates" 2>nul
+rmdir /s /q "%APP_DIST%\static" 2>nul
+
+robocopy "templates" "%APP_DIST%\templates" /MIR /R:5 /W:2 /NFL /NDL /NJH /NJS /NP
+set "ROBO_TEMPLATES=%ERRORLEVEL%"
+if %ROBO_TEMPLATES% GEQ 8 (
+  echo.
+  echo ERRO ao copiar templates para a pasta final.
+  echo Codigo Robocopy: %ROBO_TEMPLATES%
+  pause
+  exit /b 1
+)
+
+robocopy "static" "%APP_DIST%\static" /MIR /R:5 /W:2 /NFL /NDL /NJH /NJS /NP
+set "ROBO_STATIC=%ERRORLEVEL%"
+if %ROBO_STATIC% GEQ 8 (
+  echo.
+  echo ERRO ao copiar static para a pasta final.
+  echo Codigo Robocopy: %ROBO_STATIC%
+  pause
+  exit /b 1
+)
+
+if not exist "%APP_DIST%\templates\index.html" (
+  echo.
+  echo ERRO: templates\index.html nao foi copiado.
+  pause
+  exit /b 1
+)
+
+if not exist "%APP_DIST%\static\css\style.css" (
+  echo.
+  echo ERRO: static\css\style.css nao foi copiado.
+  pause
+  exit /b 1
+)
+
+if not exist "%APP_DIST%\static\js\script.js" (
+  echo.
+  echo ERRO: static\js\script.js nao foi copiado.
   pause
   exit /b 1
 )
@@ -177,7 +242,7 @@ timeout /t 4 /nobreak >nul
 echo.
 echo Criando pasta temporaria para compactacao...
 set "STAGE_ROOT=release_staging"
-set "STAGE_DIR=%STAGE_ROOT%\Verificacao_IDs_JT_Express"
+set "STAGE_DIR=%STAGE_ROOT%\%APP_FOLDER_NAME%"
 rmdir /s /q "%STAGE_ROOT%" 2>nul
 mkdir "%STAGE_DIR%"
 
@@ -197,11 +262,11 @@ if %ROBO_RC% GEQ 8 (
 
 echo.
 echo Criando ZIP da release...
-set "ZIP_NAME=Verificacao_IDs_JT_Express-v%APP_VERSION%.zip"
+set "ZIP_NAME=%APP_EXE_BASENAME%-v%APP_VERSION%.zip"
 set "ZIP_PATH=release\%ZIP_NAME%"
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%" >nul 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $src=(Resolve-Path 'release_staging\Verificacao_IDs_JT_Express').Path; $dest=(Join-Path (Resolve-Path 'release').Path '%ZIP_NAME%'); if(Test-Path $dest){Remove-Item $dest -Force}; for($i=1; $i -le 8; $i++){ try { [System.IO.Compression.ZipFile]::CreateFromDirectory($src, $dest, [System.IO.Compression.CompressionLevel]::Optimal, $true); exit 0 } catch { Write-Host ('Tentativa ' + $i + ' falhou: ' + $_.Exception.Message); Start-Sleep -Seconds 2 } }; exit 1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $src=(Resolve-Path 'release_staging\%APP_FOLDER_NAME%').Path; $dest=(Join-Path (Resolve-Path 'release').Path '%ZIP_NAME%'); if(Test-Path $dest){Remove-Item $dest -Force}; for($i=1; $i -le 8; $i++){ try { [System.IO.Compression.ZipFile]::CreateFromDirectory($src, $dest, [System.IO.Compression.CompressionLevel]::Optimal, $true); exit 0 } catch { Write-Host ('Tentativa ' + $i + ' falhou: ' + $_.Exception.Message); Start-Sleep -Seconds 2 } }; exit 1"
 
 if errorlevel 1 (
   echo.
@@ -223,5 +288,8 @@ echo %cd%\%ZIP_PATH%
 echo.
 echo Pasta do app para teste local:
 echo %cd%\%APP_DIST%
+echo.
+echo Pasta principal dentro do ZIP:
+echo %APP_FOLDER_NAME%
 echo.
 pause

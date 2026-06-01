@@ -103,6 +103,19 @@
                   <button id="togglePassword" type="button" title="Mostrar/ocultar senha">👁</button>
                 </div>
               </label>
+
+              <label class="field chrome-profile-field">
+                <span>Perfil do Chrome para clonar</span>
+                <input
+                  id="chromeProfile"
+                  type="text"
+                  placeholder="Ex: Default ou Profile 1"
+                  autocomplete="off"
+                />
+                <small class="field-hint">
+                  Digite exatamente o nome do perfil do Chrome nesta máquina. Exemplos: Default, Profile 1, Profile 2.
+                </small>
+              </label>
             </div>
 
             <label class="field ids-field">
@@ -201,27 +214,19 @@
               <h2>Dados coletados</h2>
             </div>
 
-            <span id="resultsCount" class="counter-pill">0 registros</span>
+            <div class="results-actions">
+              <span id="resultsCount" class="counter-pill">0 registros</span>
+
+              <button id="viewResultsBtn" class="mini-btn result-view-btn" type="button" disabled>
+                Ver resultados
+              </button>
+            </div>
           </div>
 
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>ID do pacote</th>
-                  <th>Conteúdo do pacote</th>
-                  <th>Valor da nota fiscal</th>
-                  <th>Status</th>
-                  <th>Mensagem</th>
-                </tr>
-              </thead>
-
-              <tbody id="resultsBody">
-                <tr class="empty-row">
-                  <td colspan="5">Nenhum dado coletado ainda.</td>
-                </tr>
-              </tbody>
-            </table>
+          <div id="resultsSummaryBox" class="results-summary-box">
+            <div class="summary-icon">📦</div>
+            <strong>Nenhum resultado para visualizar</strong>
+            <small>Quando a automação coletar dados, clique em “Ver resultados” para abrir a janela completa.</small>
           </div>
         </section>
       </section>
@@ -248,6 +253,19 @@
                   <input id="podPassword" type="password" placeholder="Digite a senha" autocomplete="off" />
                   <button id="togglePodPassword" type="button" title="Mostrar/ocultar senha">👁</button>
                 </div>
+              </label>
+
+              <label class="field chrome-profile-field">
+                <span>Perfil do Chrome para clonar</span>
+                <input
+                  id="podChromeProfile"
+                  type="text"
+                  placeholder="Ex: Default ou Profile 1"
+                  autocomplete="off"
+                />
+                <small class="field-hint">
+                  Digite exatamente o nome do perfil do Chrome nesta máquina. Exemplos: Default, Profile 1, Profile 2.
+                </small>
               </label>
             </div>
 
@@ -330,33 +348,44 @@
               <h2>Dados POD coletados</h2>
             </div>
 
-            <span id="podResultsCount" class="counter-pill">0 registros</span>
+            <div class="results-actions">
+              <span id="podResultsCount" class="counter-pill">0 registros</span>
+
+              <button id="viewPodResultsBtn" class="mini-btn result-view-btn" type="button" disabled>
+                Ver resultados
+              </button>
+            </div>
           </div>
 
-          <div class="table-wrap pod-table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>ID do pacote</th>
-                  <th>Tempo de Digitalização</th>
-                  <th>Tipo de Bipagem</th>
-                  <th>Motivo da Bipagem</th>
-                  <th>Base Responsável</th>
-                  <th>Descrição da Etapa de Bipagem</th>
-                  <th>Status</th>
-                  <th>Mensagem</th>
-                </tr>
-              </thead>
-
-              <tbody id="podResultsBody">
-                <tr class="empty-row">
-                  <td colspan="8">Nenhum dado POD coletado ainda.</td>
-                </tr>
-              </tbody>
-            </table>
+          <div id="podResultsSummaryBox" class="results-summary-box">
+            <div class="summary-icon">🧾</div>
+            <strong>Nenhum resultado POD para visualizar</strong>
+            <small>Quando a automação coletar dados, clique em “Ver resultados” para abrir a janela completa.</small>
           </div>
         </section>
       </section>
+
+      <div id="resultsModal" class="modal-backdrop hidden">
+        <div class="results-modal">
+          <div class="modal-header">
+            <div>
+              <span class="section-kicker">Resultados</span>
+              <h2 id="resultsModalTitle">Resultados coletados</h2>
+            </div>
+
+            <button id="closeResultsModal" class="modal-close" type="button">×</button>
+          </div>
+
+          <div class="results-window-info">
+            <span id="resultsModalCount">0 registros</span>
+          </div>
+
+          <div class="results-window-table-wrap">
+            <table>
+              <thead id="resultsModalHead"></thead>
+              <tbody id="resultsModalBody"></tbody>
+            </table>
+          </div>
 
       <div id="exportModal" class="modal-backdrop hidden">
         <div class="export-modal">

@@ -65,7 +65,7 @@ DEFAULT_APP_PORT = 5018
 APP_PORT = DEFAULT_APP_PORT
 MAX_LOGS = 1500
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.2"
 APP_EXE_NAME = "Verificacao_IDs_JT_Express.exe"
 UPDATER_EXE_NAME = "Atualizador.exe"
 
@@ -81,25 +81,48 @@ def app_dir() -> Path:
 
 APP_DIR = app_dir()
 
-# IMPORTANTE:
-# Quando roda em EXE, PyInstaller joga templates/static dentro do _MEIPASS.
-# Quando roda em Python normal, usa a própria pasta do projeto.
+# ============================================================
+# TEMPLATES / STATIC
+# ============================================================
+# Prioridade:
+# 1. Se existir templates/static do lado do EXE, usa eles.
+#    Assim dá pra atualizar HTML/CSS/JS sem rebuildar tudo.
+# 2. Se não existir, usa os arquivos empacotados no _MEIPASS.
+# 3. Em modo Python, usa a pasta do projeto.
+
+EXTERNAL_TEMPLATES_DIR = APP_DIR / "templates"
+EXTERNAL_STATIC_DIR = APP_DIR / "static"
+
 if getattr(sys, "frozen", False):
-    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS")).resolve()
+    MEIPASS_DIR = Path(getattr(sys, "_MEIPASS")).resolve()
+
+    if EXTERNAL_TEMPLATES_DIR.exists() and EXTERNAL_STATIC_DIR.exists():
+        RESOURCE_DIR = APP_DIR.resolve()
+    else:
+        RESOURCE_DIR = MEIPASS_DIR
 else:
     RESOURCE_DIR = APP_DIR.resolve()
 
 TEMPLATES_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
 
+print(f"[DEBUG] APP_DIR: {APP_DIR}")
+print(f"[DEBUG] RESOURCE_DIR: {RESOURCE_DIR}")
+print(f"[DEBUG] TEMPLATES_DIR: {TEMPLATES_DIR} | Existe? {TEMPLATES_DIR.exists()}")
+print(f"[DEBUG] STATIC_DIR: {STATIC_DIR} | Existe? {STATIC_DIR.exists()}")
+
 CONFIG_FILE = APP_DIR / "config.json"
+
+ROBOT_USER_DATA_DIR = APP_DIR / "chrome_jms_profile"
+ROBOT_DEFAULT_PROFILE_DIR = ROBOT_USER_DATA_DIR / "Default"
+ROBOT_PROFILE_META_FILE = ROBOT_USER_DATA_DIR / "profile_meta.json"
+
+DEFAULT_CHROME_PROFILE_TO_CLONE = "Default"
+
 EXPORTS_DIR = APP_DIR / "exports"
 VERSION_FILE = APP_DIR / "version.json"
 UPDATE_CONFIG_FILE = APP_DIR / "update_config.json"
 UPDATER_EXE_FILE = APP_DIR / UPDATER_EXE_NAME
-
-ROBOT_USER_DATA_DIR = APP_DIR / "chrome_jms_profile"
-ROBOT_DEFAULT_PROFILE_DIR = ROBOT_USER_DATA_DIR / "Default"
 
 app = Flask(
     __name__,
@@ -172,11 +195,11 @@ def decode_password(encoded: str) -> str:
 def default_config() -> Dict[str, Any]:
     return {
         "username": "",
-        "password": "",
+        "password_encoded": "",
         "save_password": False,
         "waybills": "",
-        "pod_ids": "",
         "recreate_profile": False,
+        "chrome_profile": DEFAULT_CHROME_PROFILE_TO_CLONE,
     }
 
 
@@ -195,7 +218,9 @@ def load_config() -> Dict[str, Any]:
     else:
         cfg["password"] = ""
 
-    cfg.pop("password_encoded", None)
+    if not cfg.get("chrome_profile"):
+        cfg["chrome_profile"] = DEFAULT_CHROME_PROFILE_TO_CLONE
+
     return cfg
 
 
@@ -223,6 +248,12 @@ def save_config(data: Dict[str, Any]) -> None:
         "waybills": str(data.get("waybills", existing.get("waybills", ""))),
         "pod_ids": str(data.get("pod_ids", existing.get("pod_ids", ""))),
         "recreate_profile": bool(data.get("recreate_profile", existing.get("recreate_profile", False))),
+        "chrome_profile": str(
+            data.get(
+                "chrome_profile",
+                existing.get("chrome_profile", DEFAULT_CHROME_PROFILE_TO_CLONE),
+            )
+        ).strip() or DEFAULT_CHROME_PROFILE_TO_CLONE,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -402,22 +433,154 @@ def copy_dir_tolerant(src: Path, dst: Path) -> None:
             copy_file_tolerant(root_path / filename, target_root / filename)
 
 
-def ensure_robot_profile(recreate: bool = False) -> None:
-    if recreate and ROBOT_USER_DATA_DIR.exists():
-        log("♻️ Recriando perfil clonado do Chrome...", "warn")
-        shutil.rmtree(ROBOT_USER_DATA_DIR, ignore_errors=True)
+def list_available_chrome_profiles() -> List[str]:
+    """
+    Lista os perfis do Chrome disponíveis no usuário atual do Windows.
+
+    Exemplos comuns:
+    - Default
+    - Profile 1
+    - Profile 2
+    """
+    chrome_root = get_chrome_user_data_root()
+
+    if not chrome_root.exists():
+        return []
+
+    profiles: List[str] = []
+
+    for item in chrome_root.iterdir():
+        if not item.is_dir():
+            continue
+
+        profile_name = item.name.strip()
+        lower_name = profile_name.lower()
+
+        if lower_name == "default" or lower_name.startswith("profile "):
+            profiles.append(profile_name)
+
+    return sorted(profiles, key=lambda name: (name.lower() != "default", name.lower()))
+
+
+def resolve_chrome_profile_name(profile_name: str) -> str:
+    """
+    Resolve o perfil digitado no app ignorando diferença de maiúscula/minúscula.
+
+    Se o usuário digitar:
+    - default => Default
+    - profile 1 => Profile 1
+    """
+    wanted = str(profile_name or "").strip() or DEFAULT_CHROME_PROFILE_TO_CLONE
+    available = list_available_chrome_profiles()
+
+    for profile in available:
+        if profile.lower() == wanted.lower():
+            return profile
+
+    available_text = ", ".join(available) if available else "nenhum perfil encontrado"
+
+    raise RuntimeError(
+        f"Perfil do Chrome '{wanted}' não foi encontrado nesta máquina. "
+        f"Perfis disponíveis: {available_text}"
+    )
+
+
+def read_robot_profile_meta() -> Dict[str, Any]:
+    if not ROBOT_PROFILE_META_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(ROBOT_PROFILE_META_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_robot_profile_meta(source_profile_name: str) -> None:
+    ROBOT_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "source_profile": source_profile_name,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    ROBOT_PROFILE_META_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def ensure_robot_profile(
+    recreate: bool = False,
+    chrome_profile_name: str = DEFAULT_CHROME_PROFILE_TO_CLONE,
+) -> None:
+    """
+    Cria/reutiliza o perfil fixo do robô a partir do perfil do Chrome escolhido.
+
+    O usuário pode digitar no app:
+    - Default
+    - Profile 1
+    - Profile 2
+
+    O robô sempre usa o clone fixo em:
+    chrome_jms_profile/Default
+    """
+    resolved_profile_name = resolve_chrome_profile_name(chrome_profile_name)
+
+    meta = read_robot_profile_meta()
+    previous_source_profile = str(meta.get("source_profile", "")).strip()
+
+    profile_changed = (
+        ROBOT_DEFAULT_PROFILE_DIR.exists()
+        and previous_source_profile
+        and previous_source_profile.lower() != resolved_profile_name.lower()
+    )
+
+    old_profile_without_meta = (
+        ROBOT_DEFAULT_PROFILE_DIR.exists()
+        and not previous_source_profile
+        and resolved_profile_name.lower() != "default"
+    )
+
+    if recreate:
+        log("♻️ Opção de recriar perfil marcada. Limpando perfil antigo...", "warn")
+        if ROBOT_USER_DATA_DIR.exists():
+            shutil.rmtree(ROBOT_USER_DATA_DIR, ignore_errors=True)
+
+    elif profile_changed:
+        log(
+            f"♻️ Perfil de origem mudou de '{previous_source_profile}' para '{resolved_profile_name}'. Recriando clone...",
+            "warn",
+        )
+        if ROBOT_USER_DATA_DIR.exists():
+            shutil.rmtree(ROBOT_USER_DATA_DIR, ignore_errors=True)
+
+    elif old_profile_without_meta:
+        log(
+            f"♻️ Clone antigo sem informação de origem. Recriando a partir de '{resolved_profile_name}'...",
+            "warn",
+        )
+        if ROBOT_USER_DATA_DIR.exists():
+            shutil.rmtree(ROBOT_USER_DATA_DIR, ignore_errors=True)
 
     if ROBOT_DEFAULT_PROFILE_DIR.exists():
-        log(f"✅ Usando perfil fixo já clonado: {ROBOT_USER_DATA_DIR}")
+        meta = read_robot_profile_meta()
+        saved_source = str(meta.get("source_profile", "")).strip() or resolved_profile_name
+        log(f"✅ Usando perfil fixo existente: {ROBOT_USER_DATA_DIR}")
+        log(f"👤 Perfil de origem do clone: {saved_source}")
         return
 
     chrome_root = get_chrome_user_data_root()
-    source_default = chrome_root / "Default"
+    source_profile = chrome_root / resolved_profile_name
 
-    if not source_default.exists():
-        raise RuntimeError(f"Não encontrei o perfil Default do Chrome em: {source_default}")
+    if not source_profile.exists():
+        available_text = ", ".join(list_available_chrome_profiles()) or "nenhum perfil encontrado"
+        raise RuntimeError(
+            f"Não encontrei o perfil '{resolved_profile_name}' em: {source_profile}. "
+            f"Perfis disponíveis: {available_text}"
+        )
 
-    log("📁 Clonando perfil Default do Chrome para o perfil fixo do robô...")
+    log(f"📁 Perfil fixo ainda não existe. Clonando Chrome: {resolved_profile_name}")
+    log("⏳ Em máquina mais lenta, a primeira clonagem pode demorar alguns minutos.")
 
     ROBOT_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -426,9 +589,11 @@ def ensure_robot_profile(recreate: bool = False) -> None:
     if local_state.exists():
         copy_file_tolerant(local_state, ROBOT_USER_DATA_DIR / "Local State")
 
-    copy_dir_tolerant(source_default, ROBOT_DEFAULT_PROFILE_DIR)
+    copy_dir_tolerant(source_profile, ROBOT_DEFAULT_PROFILE_DIR)
+    write_robot_profile_meta(resolved_profile_name)
 
-    log("✅ Perfil clonado com sucesso.")
+    log(f"✅ Perfil '{resolved_profile_name}' clonado com sucesso.")
+    log("✅ Nas próximas execuções, esse perfil clonado será reutilizado.")
 
 
 # ============================================================
@@ -1533,9 +1698,10 @@ def query_pod_tracking(
     headers: Dict[str, str],
     waybill: str,
 ) -> Dict[str, Any]:
+    waybill = str(waybill).strip()
+
     request_headers = dict(headers)
 
-    # Garante o nome exato do header igual ao Network
     token = (
         request_headers.get("authToken")
         or request_headers.get("authtoken")
@@ -1548,7 +1714,9 @@ def query_pod_tracking(
         {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-GB,en;q=0.8",
-            "Cache-Control": "max-age=2, must-revalidate",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
             "Content-Type": "application/json;charset=UTF-8",
             "Origin": "https://jmsbr.jtjms-br.com",
             "Referer": "https://jmsbr.jtjms-br.com/",
@@ -1560,6 +1728,7 @@ def query_pod_tracking(
             "routeName": "trackingExpress",
             "routerNameList": "%E6%93%8D%E4%BD%9C%E5%B9%B3%E5%8F%B0%3E%E5%BF%AB%E4%BB%B6%E6%9F%A5%E8%AF%A2%3E%E5%BF%AB%E4%BB%B6%E8%B7%9F%E8%B8%AA",
             "timezone": "GMT-0300",
+            "Connection": "close",
         }
     )
 
@@ -1581,104 +1750,97 @@ def query_pod_tracking(
         "http_status": "",
     }
 
-    last_message = ""
-    last_status: Any = ""
-    last_debug_path = ""
+    payload = {
+        "keywordList": [waybill],
+        "trackingTypeEnum": "WAYBILL",
+        "countryId": "1",
+    }
+
+    # Esse nonce força o gateway a enxergar como uma request nova.
+    # Importante para quando der HTTP 405 no mesmo ID.
+    request_nonce = datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+    request_url = (
+        f"{POD_TRACKING_API}"
+        f"?_t={request_nonce}"
+        f"&_waybill={quote(waybill)}"
+    )
+
+    request_headers["X-Request-Id"] = f"pod-{waybill}-{request_nonce}"
+    request_headers["X-Request-Nonce"] = request_nonce
 
     try:
-        for attempt in pod_request_payloads(waybill):
-            attempt_name = attempt["name"]
-            payload = attempt["payload"]
-
-            response = session.post(
-                POD_TRACKING_API,
-                headers=request_headers,
-                json=payload,
-                timeout=45,
-            )
-
-            last_status = response.status_code
-
-            try:
-                response_data = response.json()
-            except Exception:
-                response_data = {
-                    "raw": response.text[:5000],
-                }
-
-            try:
-                last_debug_path = save_pod_debug_response(
-                    waybill=waybill,
-                    payload=payload,
-                    status_code=response.status_code,
-                    response_data=response_data,
-                    attempt_name=attempt_name,
-                )
-            except TypeError:
-                last_debug_path = save_pod_debug_response(
-                    waybill=waybill,
-                    payload=payload,
-                    status_code=response.status_code,
-                    response_data=response_data,
-                )
-
-            if response.status_code in (401, 403):
-                base_row["http_status"] = response.status_code
-                base_row["message"] = (
-                    f"Sem autorização ({response.status_code}). "
-                    "Token pode ter expirado."
-                )
-                return base_row
-
-            msg = deep_find_message(response_data)
-
-            if msg:
-                last_message = msg
-
-            if not response.ok:
-                continue
-
-            detail = extract_first_pod_detail(response_data)
-
-            if not detail:
-                continue
-
-            row = build_pod_row_from_detail(
-                waybill=waybill,
-                detail=detail,
-                http_status=response.status_code,
-            )
-
-            if any(
-                [
-                    row.get("scanTime"),
-                    row.get("scanTypeName"),
-                    row.get("remark1"),
-                    row.get("scanNetworkName"),
-                    row.get("podTemplateContent"),
-                ]
-            ):
-                row["status"] = "ok"
-                row["message"] = "Consulta concluída usando payload real do Network."
-                return row
-
-            row["status"] = "aviso"
-            row["message"] = (
-                "Encontrei details[0], mas os campos esperados vieram vazios."
-            )
-            return row
-
-        base_row["status"] = "aviso"
-        base_row["http_status"] = last_status
-        base_row["message"] = (
-            last_message
-            or f"HTTP {last_status}. Não encontrei data[0].details[0] no retorno."
+        response = session.post(
+            request_url,
+            headers=request_headers,
+            json=payload,
+            timeout=45,
         )
 
-        if last_debug_path:
-            base_row["message"] += f" Debug salvo em: {last_debug_path}"
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = {
+                "raw": response.text[:5000],
+            }
 
-        return base_row
+        try:
+            response.close()
+        except Exception:
+            pass
+
+        base_row["http_status"] = response.status_code
+
+        if response.status_code in (401, 403):
+            base_row["message"] = (
+                f"Sem autorização ({response.status_code}). "
+                "Token pode ter expirado."
+            )
+            return base_row
+
+        if not response.ok:
+            msg = deep_find_message(response_data)
+
+            base_row["message"] = (
+                msg
+                or f"HTTP {response.status_code}. Não encontrei data[0].details[0] no retorno."
+            )
+            return base_row
+
+        detail = extract_first_pod_detail(response_data)
+
+        if not detail:
+            msg = deep_find_message(response_data)
+
+            base_row["status"] = "aviso"
+            base_row["message"] = (
+                msg
+                or f"HTTP {response.status_code}. Não encontrei data[0].details[0] no retorno."
+            )
+            return base_row
+
+        row = build_pod_row_from_detail(
+            waybill=waybill,
+            detail=detail,
+            http_status=response.status_code,
+        )
+
+        if any(
+            [
+                row.get("scanTime"),
+                row.get("scanTypeName"),
+                row.get("remark1"),
+                row.get("scanNetworkName"),
+                row.get("podTemplateContent"),
+            ]
+        ):
+            row["status"] = "ok"
+            row["message"] = "Consulta concluída."
+            return row
+
+        row["status"] = "aviso"
+        row["message"] = "Encontrei details[0], mas os campos esperados vieram vazios."
+        return row
 
     except requests.RequestException as exc:
         base_row["message"] = f"Falha na request POD Tracking: {exc}"
@@ -1694,6 +1856,9 @@ def automation_worker(payload: Dict[str, Any]) -> None:
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
         recreate_profile = bool(payload.get("recreate_profile"))
+        chrome_profile = str(
+            payload.get("chrome_profile", DEFAULT_CHROME_PROFILE_TO_CLONE)
+        ).strip() or DEFAULT_CHROME_PROFILE_TO_CLONE
         ids = parse_waybills(str(payload.get("waybills", "")))
 
         if not ids:
@@ -1703,7 +1868,10 @@ def automation_worker(payload: Dict[str, Any]) -> None:
 
         log(f"🚀 Iniciando automação para {len(ids)} ID(s).")
 
-        ensure_robot_profile(recreate=recreate_profile)
+        ensure_robot_profile(
+            recreate=recreate_profile,
+            chrome_profile_name=chrome_profile,
+        )
 
         if stop_event.is_set():
             raise RuntimeError("Automação interrompida antes de abrir o Chrome.")
@@ -1797,11 +1965,68 @@ def pod_automation_worker(payload: Dict[str, Any]) -> None:
     global pod_current_driver
 
     driver: Optional[webdriver.Chrome] = None
+    session: Optional[requests.Session] = None
+    headers: Dict[str, str] = {}    
+
+    # Ajustes anti-bloqueio
+    SLEEP_ENTRE_IDS = 0.75
+    TENTATIVAS_HTTP_405 = 5
+    PAUSA_HTTP_405 = 30
+
+    def renovar_sessao_jms() -> Tuple[requests.Session, Dict[str, str]]:
+        nonlocal driver
+
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+
+        driver = None
+        pod_current_driver = None
+
+        pod_log("🔄 Renovando sessão JMS para continuar as consultas POD...")
+
+        new_driver = create_chrome_driver()
+
+        globals()["pod_current_driver"] = new_driver
+        driver = new_driver
+
+        token, user_data, _storage = login_and_get_auth(driver, username, password)
+
+        if user_data:
+            staff = user_data.get("staffNo") or user_data.get("userCode") or ""
+            network = user_data.get("networkCode") or ""
+            pod_log(f"👤 Sessão renovada: staffNo={staff} | networkCode={network}")
+        else:
+            pod_log(
+                "ℹ️ Token renovado, mas userData não foi localizado no localStorage.",
+                "warn",
+            )
+
+        new_session = selenium_cookies_to_requests(driver)
+        new_headers = build_headers(driver, token, user_data)
+
+        pod_log("✅ Sessão JMS renovada com sucesso.")
+        pod_log("🔒 Fechando Chrome. Consultas continuarão em segundo plano...")
+
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+        globals()["pod_current_driver"] = None
+        driver = None
+
+        return new_session, new_headers
 
     try:
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
         recreate_profile = bool(payload.get("recreate_profile"))
+        chrome_profile = str(
+            payload.get("chrome_profile", DEFAULT_CHROME_PROFILE_TO_CLONE)
+        ).strip() or DEFAULT_CHROME_PROFILE_TO_CLONE
         ids = parse_waybills(str(payload.get("pod_ids", "")))
 
         if not ids:
@@ -1811,7 +2036,10 @@ def pod_automation_worker(payload: Dict[str, Any]) -> None:
 
         pod_log(f"🚀 Iniciando POD Tracking para {len(ids)} ID(s).")
 
-        ensure_robot_profile(recreate=recreate_profile)
+        ensure_robot_profile(
+            recreate=recreate_profile,
+            chrome_profile_name=chrome_profile,
+        )
 
         if pod_stop_event.is_set():
             raise RuntimeError("Automação interrompida antes de abrir o Chrome.")
@@ -1859,7 +2087,43 @@ def pod_automation_worker(payload: Dict[str, Any]) -> None:
 
             pod_log(f"🔎 Consultando POD {index}/{len(ids)}: {waybill}")
 
-            row = query_pod_tracking(session, headers, waybill)
+            row = None
+
+            for tentativa in range(1, TENTATIVAS_HTTP_405 + 1):
+                row = query_pod_tracking(session, headers, waybill)
+
+                http_status = str(row.get("http_status", "")).strip()
+
+                if http_status != "405":
+                    break
+
+                pod_log(
+                    f"⚠️ HTTP 405 no ID {waybill}. "
+                    f"Resetando request específica desse ID e tentando novamente "
+                    f"({tentativa}/{TENTATIVAS_HTTP_405})...",
+                    "warn",
+                )
+
+                time.sleep(5)
+
+                try:
+                    session, headers = renovar_sessao_jms()
+                except Exception as exc:
+                    pod_log(f"⚠️ Falha ao renovar sessão após HTTP 405: {exc}", "warn")
+
+            if row is None:
+                row = {
+                    "waybillNo": waybill,
+                    "scanTime": "",
+                    "scanTypeName": "",
+                    "remark1": "",
+                    "scanNetworkName": "",
+                    "podTemplateContent": "",
+                    "status": "erro",
+                    "message": "Falha desconhecida na consulta POD.",
+                    "http_status": "",
+                }
+
             pod_append_result(row)
 
             if row.get("status") == "ok":
@@ -1873,7 +2137,7 @@ def pod_automation_worker(payload: Dict[str, Any]) -> None:
                 level = "warn" if row.get("status") == "aviso" else "error"
                 pod_log(f"⚠️ {waybill} | {row.get('message', '')}", level)
 
-            time.sleep(0.35)
+            time.sleep(SLEEP_ENTRE_IDS)
 
         if not pod_stop_event.is_set():
             pod_set_state(status="finished", current=len(ids))
@@ -2139,6 +2403,8 @@ def api_update_apply():
             str(os.getpid()),
             "--config",
             str(UPDATE_CONFIG_FILE),
+            "--main-folder-name",
+            "JMS_Coletor_Waybill",
         ]
 
         subprocess.Popen(args, cwd=str(temp_dir), close_fds=True)
@@ -2162,6 +2428,15 @@ def api_update_apply():
 @app.get("/api/config")
 def api_get_config():
     return jsonify(load_config())
+
+
+@app.get("/api/chrome/profiles")
+def api_chrome_profiles():
+    try:
+        profiles = list_available_chrome_profiles()
+        return jsonify({"ok": True, "profiles": profiles})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc), "profiles": []}), 400
 
 
 @app.post("/api/config")

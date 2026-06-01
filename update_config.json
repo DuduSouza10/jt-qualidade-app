@@ -1,6 +1,6 @@
 {
-  "owner": "SEU_USUARIO_OU_ORGANIZACAO",
-  "repo": "SEU_REPOSITORIO",
+  "owner": "DuduSouza10",
+  "repo": "jt-qualidade-app",
   "asset_contains": "Verificacao_IDs_JT_Express",
   "allow_prerelease": false,
   "github_token": ""
